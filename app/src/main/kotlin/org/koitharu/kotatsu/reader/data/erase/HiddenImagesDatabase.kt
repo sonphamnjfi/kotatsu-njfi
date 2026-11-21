@@ -1,7 +1,6 @@
 package org.koitharu.kotatsu.reader.data.erase
 
 import android.content.Context
-import androidx.room.AutoMigration
 import androidx.room.ColumnInfo
 import androidx.room.Dao
 import androidx.room.Database
@@ -192,14 +191,7 @@ abstract class HiddenImagesDao {
 @Database(
 	entities = [HiddenImageEntity::class, HiddenPageEntity::class, PageScanEntity::class],
 	version = 7,
-	autoMigrations = [
-		AutoMigration(from = 1, to = 2),
-		AutoMigration(from = 2, to = 3),
-		AutoMigration(from = 3, to = 4),
-		AutoMigration(from = 4, to = 5, spec = ForgetUnreliableMatches::class),
-		AutoMigration(from = 5, to = 6),
-		AutoMigration(from = 6, to = 7),
-	],
+	exportSchema = false,
 )
 abstract class HiddenImagesDatabase : RoomDatabase() {
 	abstract fun getDao(): HiddenImagesDao
@@ -227,5 +219,6 @@ object HiddenImagesModule {
 	@Singleton
 	fun provideHiddenImagesDatabase(@ApplicationContext context: Context): HiddenImagesDatabase = Room
 		.databaseBuilder(context, HiddenImagesDatabase::class.java, "kotatsu-hidden-images-db")
+		.fallbackToDestructiveMigration(dropAllTables = true)
 		.build()
 }
