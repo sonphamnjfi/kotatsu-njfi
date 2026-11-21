@@ -181,7 +181,7 @@ internal class HentaiCube(context: MangaLoaderContext) :
 				delay(PAGINATION_DELAY_MS)
 			}
 			val pageDoc = try {
-				webClient.httpPost("$chaptersAjaxUrl?t=$page", emptyMap(), xhrHeaders).parseHtml()
+				webClient.httpPost("$chaptersAjaxUrl?t=$page".toHttpUrl(), emptyMap<String, String>(), xhrHeaders).parseHtml()
 			} catch (_: NotFoundException) {
 				break
 			} catch (e: HttpStatusException) {
@@ -191,7 +191,7 @@ internal class HentaiCube(context: MangaLoaderContext) :
 						?: document.selectFirst("a[data-post]")?.attr("data-post")?.takeIf { it.isNotBlank() }
 					if (!mangaId.isNullOrBlank()) {
 						val legacyDoc = webClient.httpPost(
-							"$baseOrigin/wp-admin/admin-ajax.php",
+							"$baseOrigin/wp-admin/admin-ajax.php".toHttpUrl(),
 							"action=manga_get_chapters&manga=$mangaId",
 							xhrHeaders,
 						).parseHtml()
@@ -272,7 +272,7 @@ internal class HentaiCube(context: MangaLoaderContext) :
 			val payload = JSONObject()
 				.put("manga", mangaId)
 				.put("chapter", chapterId)
-			val json = webClient.httpPost("$baseApiUrl/pages", payload, apiHeaders).parseJson()
+			val json = webClient.httpPost("$baseApiUrl/pages".toHttpUrl(), payload, apiHeaders).parseJson()
 			val items = json.getJSONArray("items")
 			return (0 until items.length()).map { i ->
 				val url = items.getString(i)
