@@ -4,6 +4,9 @@ import kotlinx.coroutines.delay
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import org.jsoup.HttpStatusException
 import org.jsoup.nodes.Document
@@ -82,8 +85,14 @@ internal class HentaiCube(context: MangaLoaderContext) :
 
 			append("/?s=")
 
-			filter.query?.let {
-				append(filter.query.urlEncoded())
+			filter.query?.let { rawQuery ->
+				val queryFixed = rawQuery
+					.replace("–", "-")
+					.replace("’", "'")
+					.replace("“", "\"")
+					.replace("”", "\"")
+					.replace("…", "...")
+				append(queryFixed.urlEncoded())
 			}
 
 			append("&post_type=wp-manga")
@@ -268,11 +277,30 @@ internal class HentaiCube(context: MangaLoaderContext) :
 				.set("Accept", "application/json")
 				.set("X-MSR-Request", "1")
 				.set("Referer", resolvedChapterUrl)
+				.set("Origin", resolvedOrigin)
 				.build()
 			val payload = JSONObject()
 				.put("manga", mangaId)
 				.put("chapter", chapterId)
-			val json = webClient.httpPost("$baseApiUrl/pages".toHttpUrl(), payload, apiHeaders).parseJson()
+			val pagesUrl = "$baseApiUrl/pages".toHttpUrl()
+			val request = Request.Builder()
+				.url(pagesUrl)
+				.post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+				.headers(apiHeaders)
+				.tag(MangaSource::class.java, source)
+				.build()
+			val response = context.httpClient.newCall(request).await()
+			if (response.code == 401 || response.code == 403) {
+				runCatching { response.close() }
+				context.requestBrowserAction(this, resolvedChapterUrl)
+			}
+			if (!response.isSuccessful) {
+				val code = response.code
+				val message = response.message
+				runCatching { response.close() }
+				throw HttpStatusException(message, code, pagesUrl.toString())
+			}
+			val json = response.parseJson()
 			val items = json.getJSONArray("items")
 			return (0 until items.length()).map { i ->
 				val url = items.getString(i)
@@ -305,7 +333,24 @@ internal class HentaiCube(context: MangaLoaderContext) :
 					.addQueryParameter("token", currentToken)
 					.addQueryParameter("cid", clientId)
 					.build()
-				val data = webClient.httpGet(apiUrl, apiHeaders).parseJson()
+				val request = Request.Builder()
+					.get()
+					.url(apiUrl)
+					.headers(apiHeaders)
+					.tag(MangaSource::class.java, source)
+					.build()
+				val response = context.httpClient.newCall(request).await()
+				if (response.code == 401 || response.code == 403) {
+					runCatching { response.close() }
+					context.requestBrowserAction(this, resolvedChapterUrl)
+				}
+				if (!response.isSuccessful) {
+					val code = response.code
+					val message = response.message
+					runCatching { response.close() }
+					throw HttpStatusException(message, code, apiUrl.toString())
+				}
+				val data = response.parseJson()
 				val items = data.optJSONArray("items")
 				if (items != null) {
 					for (i in 0 until items.length()) {

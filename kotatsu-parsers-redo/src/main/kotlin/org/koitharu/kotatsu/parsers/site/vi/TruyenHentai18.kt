@@ -1,35 +1,39 @@
 package org.koitharu.kotatsu.parsers.site.vi
 
-import org.json.JSONObject
-import org.jsoup.nodes.Document
+import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
-import org.koitharu.kotatsu.parsers.util.json.*
+import org.koitharu.kotatsu.parsers.util.suspendlazy.getOrNull
+import org.koitharu.kotatsu.parsers.util.suspendlazy.suspendLazy
 import java.text.SimpleDateFormat
 import java.util.*
 
 @MangaSourceParser("TRUYENHENTAI18", "TruyenHentai18", "vi", ContentType.HENTAI)
-internal class TruyenHentai18(context: MangaLoaderContext):
+internal class TruyenHentai18(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.TRUYENHENTAI18, 18) {
 
-	override val configKeyDomain = ConfigKey.Domain("truyenhentai18.app")
+	override val configKeyDomain = ConfigKey.Domain("truyenhentai18.net", "truyenhentai18.app")
 
-	private val apiSuffix = "api.th18.app"
-	private val cdnSuffix = "vi-api.th18.app"
+	private val availableTags = suspendLazy(initializer = ::fetchTags)
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
 	}
 
+	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
+		.set("Referer", "https://$domain/")
+		.build()
+
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.UPDATED,
-		SortOrder.NEWEST,
-		SortOrder.NEWEST_ASC,
+		SortOrder.POPULARITY,
 	)
 
 	override val filterCapabilities: MangaListFilterCapabilities
@@ -38,179 +42,160 @@ internal class TruyenHentai18(context: MangaLoaderContext):
 		)
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
-		availableTags = emptySet(), // cant find any URLs for fetch tags
+		availableTags = availableTags.get(),
 	)
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
 		val url = when {
+			!filter.query.isNullOrBlank() -> {
+				buildPagedUrl("", page).toHttpUrl().newBuilder()
+					.addQueryParameter("s", filter.query.trim())
+					.build()
+			}
+
 			filter.tags.isNotEmpty() -> {
-				buildString {
-					append(domain)
-					append("/vi/the-loai/")
-					append(filter.tags.first().key)
-					append("/page/")
-					append(page)
-				}
+				val slug = filter.tags.first().key
+				buildPagedUrl("/category/$slug", page).toHttpUrl()
 			}
 
-			else -> {
-				buildString {
-					append("$apiSuffix/posts")
-					append("?language=vi")
-					
-					append("&order=")
-					append(
-						when (order) {
-							SortOrder.UPDATED -> "latest"
-							SortOrder.NEWEST -> "newest"
-							SortOrder.NEWEST_ASC -> "oldest"
-							else -> "latest" // default
-						}
-					)
-
-					append("&limit=24")
-					append("&page=")
-					append(page)
-
-					if (!filter.query.isNullOrEmpty()) {
-						append("&query=${filter.query}")
-					}
-				}
-			}
+			order == SortOrder.POPULARITY -> buildPagedUrl("/xem-nhieu-nhat", page).toHttpUrl()
+			else -> buildPagedUrl("/moi-cap-nhat", page).toHttpUrl()
 		}
 
-		return when {
-			filter.tags.isNotEmpty() -> parseNextList(webClient.httpGet("https://$url").parseHtml())
-			else -> {
-				val doc = webClient.httpGet("https://$url").parseJson()
-				parseJSONList(doc)
-			}
-		}
-	}
+		val doc = webClient.httpGet(url).parseHtml()
+		return doc.select("div.col-6.col-md-4.col-lg-2.mb-3").mapNotNull { element ->
+			val link = element.selectFirst("a") ?: return@mapNotNull null
+			val href = link.attrAsRelativeUrlOrNull("href") ?: return@mapNotNull null
+			val title = element.selectFirst("h2")?.textOrNull()
+				?: link.attrOrNull("title")
+				?: return@mapNotNull null
+			val coverUrl = element.selectFirst("img")?.src().orEmpty()
 
-	private fun parseJSONList(json: JSONObject): List<Manga> {
-		return json.getJSONArray("data").mapJSON { mangaItem ->
 			Manga(
-				id = mangaItem.getLong("id"),
-				title = mangaItem.getString("title"),
-				altTitles = setOfNotNull(
-					mangaItem.optString("official_name").takeIf { !it.isNullOrBlank() }
-				),
-				url = mangaItem.getString("slug"),
-				publicUrl = mangaItem.getString("slug").toAbsoluteUrl(domain),
+				id = generateUid(href),
+				title = title,
+				altTitles = emptySet(),
+				url = href,
+				publicUrl = href.toAbsoluteUrl(domain),
 				rating = RATING_UNKNOWN,
 				contentRating = ContentRating.ADULT,
-				coverUrl = "https://$cdnSuffix/uploads/${mangaItem.getString("thumbnail")}",
-				tags = mangaItem.optJSONArray("genres")?.mapJSON { genreItem ->
-					MangaTag(
-						key = genreItem.getString("slug"),
-						title = genreItem.getString("name"),
-						source = source
-					)
-				}?.toSet() ?: emptySet(),
-				state = when (mangaItem.optString("post_status")) {
-					"completed" -> MangaState.FINISHED
-					else -> MangaState.ONGOING
-				},
-				authors = mangaItem.optJSONArray("authors")?.mapJSON { authorItem ->
-					authorItem.optString("name")
-				}?.filterNotNull()?.toSet() ?: emptySet(),
+				coverUrl = coverUrl,
+				tags = emptySet(),
+				state = null,
+				authors = emptySet(),
 				source = source,
-				description = mangaItem.optString("content").orEmpty(),
 			)
 		}
 	}
 
-	private fun parseNextList(doc: Document): List<Manga> {
-		val script = doc.select("script").firstOrNull { it.data().contains("response") }
-			?: throw Exception("Không tìm thấy script chứa dữ liệu manga")
-
-		val scriptContent = script.data()
-		val cleanedScript = scriptContent
-			.replace("self.__next_f.push([1,", "")
-			.replace("\"5:", "")
-			.replace("[[\"$\",\"script\",null,{\"type\":\"application/ld+json\",\"dangerouslySetInnerHTML\":{\"__html\":\"$1a\"}}],", "")
-			.replace("[[\"$\",\"script\",null,{\"type\":\"application/ld+json\",\"dangerouslySetInnerHTML\":{\"__html\":", "")
-			.replace("\\\\\",", ",")
-			.replace("\\\"", "\"")
-			.replace("\\\\", "\\")
-			.replace("[\\n\\r\\t]", "")
-
-		val responseStart = cleanedScript.indexOf("{\"response\":")
-		if (responseStart == -1) throw Exception("Không tìm thấy object 'response' trong script")
-
-		val jsonStr = extractJsonString(cleanedScript, responseStart)
-		val responseObj = JSONObject(jsonStr)
-		val dataArray = responseObj.getJSONObject("response").optJSONArray("data")
-			?: throw Exception("Không tìm thấy trường 'data' trong object 'response'")
-
-		return (0 until dataArray.length()).map { idx ->
-			val item = dataArray.getJSONObject(idx)
-			val genres = extractGenres(item)
-			val authors = extractAuthors(item)
-
-			Manga(
-				id = item.getLong("id"),
-				title = item.getString("title"),
-				altTitles = setOfNotNull(item.optString("official_name").takeIf { it.isNotBlank() }),
-				url = item.getString("slug"),
-				publicUrl = item.getString("slug").toAbsoluteUrl(domain),
-				rating = RATING_UNKNOWN,
-				contentRating = ContentRating.ADULT,
-				coverUrl = "https://$cdnSuffix/uploads/${item.getString("thumbnail")}",
-				tags = genres,
-				state = when (item.optString("post_status")) {
-					"completed" -> MangaState.FINISHED
-					else -> MangaState.ONGOING
-				},
-				authors = authors,
-				source = source,
-				description = item.optString("content").orEmpty()
-			)
-		}
+	private fun buildPagedUrl(path: String, page: Int): String = if (page > 1) {
+		"https://$domain$path/page/$page"
+	} else {
+		"https://$domain$path"
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
-        val fullUrl = "https://$domain/vi/" + manga.url + ".html"
-		val doc = webClient.httpGet(fullUrl).parseHtml()
-		return manga.copy(
-			chapters = doc.select("div.grid.grid-cols-1.md\\:grid-cols-2.gap-4 a.block")
-				.mapChapters(reversed = false) { i, e ->
-					val name = e.selectFirst("span.truncate")?.text() ?: e.attr("title") ?: ""
-					val href = e.selectFirst("a")?.attrAsRelativeUrl("href") ?: ""
-					val dateText = e.selectFirst("div.text-xs.text-gray-500")?.text()
-					MangaChapter(
-						id = generateUid(href),
-						title = name,
-						url = href,
-						number = i + 1f,
-						volume = 0,
-						uploadDate = parseChapterDate(dateText),
-						scanlator = null,
-						branch = null,
-						source = source,
-					)
+		val resolvedUrl = if (!manga.url.startsWith("/") && "://" !in manga.url && !manga.url.endsWith(".html")) {
+			"/${manga.url}.html".toAbsoluteUrl(domain)
+		} else {
+			manga.url.toAbsoluteUrl(domain)
+		}
+		val doc = webClient.httpGet(resolvedUrl).parseHtml()
+
+		val title = doc.selectFirst("h1")?.textOrNull() ?: manga.title
+		val coverUrl = doc.selectFirst("img.manga-cover")?.src()
+			?: doc.selectFirst(".card img.img-fluid")?.src()
+			?: manga.coverUrl
+
+		val cachedTags = availableTags.getOrNull().orEmpty()
+		val tags = doc.select("a.badge.bg-primary").mapNotNullToSet { a ->
+			val tagTitle = a.textOrNull() ?: return@mapNotNullToSet null
+			val pathSegments = a.absUrl("href").toHttpUrlOrNull()?.pathSegments
+			val categoryIndex = pathSegments?.indexOf("category") ?: -1
+			val slugFromHref = if (categoryIndex >= 0) {
+				pathSegments?.getOrNull(categoryIndex + 1)?.takeIf { it.isNotEmpty() }
+			} else {
+				null
+			}
+			cachedTags.find { it.title.equals(tagTitle, ignoreCase = true) }
+				?: MangaTag(
+					key = slugFromHref ?: tagTitle.lowercase(Locale.ROOT).trim().replace(WHITESPACE_REGEX, "-"),
+					title = tagTitle,
+					source = source,
+				)
+		}
+
+		val infoElements = doc.select(".list-group-item, div")
+		var state: MangaState? = null
+		val statusEl = infoElements.lastOrNull { el ->
+			val lower = el.text().lowercase(Locale.ROOT)
+			"trạng thái:" in lower &&
+				el.select(".list-group-item, div").none { child ->
+					child !== el && "trạng thái:" in child.text().lowercase(Locale.ROOT)
 				}
+		}
+		if (statusEl != null) {
+			val lower = statusEl.text().lowercase(Locale.ROOT)
+			state = when {
+				"hoàn thành" in lower -> MangaState.FINISHED
+				"đang tiến hành" in lower -> MangaState.ONGOING
+				else -> null
+			}
+		}
+
+		var author: String? = null
+		val authorEl = infoElements.lastOrNull { el ->
+			val lower = el.text().lowercase(Locale.ROOT)
+			"tác giả:" in lower &&
+				el.select(".list-group-item, div").none { child ->
+					child !== el && "tác giả:" in child.text().lowercase(Locale.ROOT)
+				}
+		}
+		if (authorEl != null) {
+			author = authorEl.text().substringAfter(":").trim().nullIfEmpty()
+		}
+
+		val description = doc.select(".description")
+			.mapNotNull { it.wholeText().trim().nullIfEmpty() }
+			.joinToString("\n")
+			.nullIfEmpty()
+
+		val chapters = doc.select("div.chapter-item").mapChapters(reversed = true) { i, element ->
+			val link = element.selectFirst("a.fw-bold") ?: element.selectFirst("a") ?: return@mapChapters null
+			val href = link.attrAsRelativeUrlOrNull("href") ?: return@mapChapters null
+			val name = link.textOrNull()
+			val dateText = element.selectFirst("div.chapter-date")?.text()
+			MangaChapter(
+				id = generateUid(href),
+				title = name,
+				url = href,
+				number = i + 1f,
+				volume = 0,
+				uploadDate = parseRelativeDate(dateText),
+				scanlator = null,
+				branch = null,
+				source = source,
 			)
+		}
+
+		return manga.copy(
+			title = title,
+			coverUrl = coverUrl,
+			tags = tags,
+			state = state,
+			authors = setOfNotNull(author),
+			description = description,
+			chapters = chapters,
+		)
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
-		val scriptContent = doc.select("script")
-			.firstOrNull { it.data().contains("img src") }
-			?.data()
-			?: return emptyList()
+		val images = doc.select("div#viewer.chapter-container img")
+			.ifEmpty { doc.select("div#viewer img, div.chapter-container img") }
 
-		val decoded = scriptContent
-			.replace("\\u003c", "<")
-			.replace("\\u003e", ">")
-			.replace("\\\"", "\"")
-			.replace("\\/", "/")
-
-		val regex = Regex("""img\s+src=["'](https?://[^"']+)["']""")
-		val imageUrls = regex.findAll(decoded).map { it.groupValues[1] }.toList()
-
-		return imageUrls.map { url ->
+		return images.mapNotNull { img ->
+			val url = img.src() ?: return@mapNotNull null
 			MangaPage(
 				id = generateUid(url),
 				url = url,
@@ -220,67 +205,57 @@ internal class TruyenHentai18(context: MangaLoaderContext):
 		}
 	}
 
-	private fun parseChapterDate(date: String?): Long {
-		if (date == null) return 0
-		return when {
-			date.contains("giây trước") -> System.currentTimeMillis() - date.removeSuffix(" giây trước").toLong() * 1000
-			date.contains("phút trước") -> System.currentTimeMillis() - date.removeSuffix(" phút trước")
-				.toLong() * 60 * 1000
+	private fun parseRelativeDate(value: String?): Long {
+		val raw = value?.substringAfterLast("•")?.trim()?.takeIf { it.isNotEmpty() } ?: return 0L
+		val lower = raw.lowercase(Locale.ROOT)
+		if ("trước" in lower) {
+			val amount = DATE_NUMBER_REGEX.find(lower)?.value?.toLongOrNull() ?: return 0L
+			val offsetMs = when {
+				"giây" in lower -> amount * 1000L
+				"phút" in lower -> amount * 60_000L
+				"giờ" in lower || "tiếng" in lower -> amount * 3_600_000L
+				"ngày" in lower -> amount * 86_400_000L
+				"tuần" in lower -> amount * 7L * 86_400_000L
+				"tháng" in lower -> amount * 30L * 86_400_000L
+				"năm" in lower -> amount * 365L * 86_400_000L
+				else -> null
+			}
+			if (offsetMs != null) {
+				return System.currentTimeMillis() - offsetMs
+			}
+		}
 
-			date.contains("giờ trước") -> System.currentTimeMillis() - date.removeSuffix(" giờ trước")
-				.toLong() * 60 * 60 * 1000
+		return runCatching {
+			SimpleDateFormat("dd/MM/yyyy", Locale.ROOT).apply {
+				timeZone = TimeZone.getTimeZone("Asia/Ho_Chi_Minh")
+			}.parse(raw)?.time
+		}.getOrNull() ?: 0L
+	}
 
-			date.contains("ngày trước") -> System.currentTimeMillis() - date.removeSuffix(" ngày trước")
-				.toLong() * 24 * 60 * 60 * 1000
+	private suspend fun fetchTags(): Set<MangaTag> {
+		val doc = webClient.httpGet("https://$domain/").parseHtml()
+		val links = doc.selectFirst("#categoryDropdown")
+			?.nextElementSibling()
+			?.select("a[href*=/category/]")
+			?.takeIf { it.isNotEmpty() }
+			?: doc.select("a[href*=/category/]")
 
-			date.contains("tuần trước") -> System.currentTimeMillis() - date.removeSuffix(" tuần trước")
-				.toLong() * 7 * 24 * 60 * 60 * 1000
-
-			date.contains("tháng trước") -> System.currentTimeMillis() - date.removeSuffix(" tháng trước")
-				.toLong() * 30 * 24 * 60 * 60 * 1000
-
-			date.contains("năm trước") -> System.currentTimeMillis() - date.removeSuffix(" năm trước")
-				.toLong() * 365 * 24 * 60 * 60 * 1000
-
-			else -> SimpleDateFormat("dd/MM/yyyy", Locale.US).parse(date)?.time ?: 0L
+		return links.mapNotNullToSet { link ->
+			val title = link.textOrNull() ?: return@mapNotNullToSet null
+			val pathSegments = link.absUrl("href").toHttpUrlOrNull()?.pathSegments ?: return@mapNotNullToSet null
+			val categoryIndex = pathSegments.indexOf("category")
+			val slug = pathSegments.getOrNull(categoryIndex + 1)?.takeIf { it.isNotEmpty() }
+				?: return@mapNotNullToSet null
+			MangaTag(
+				key = slug,
+				title = title,
+				source = source,
+			)
 		}
 	}
 
-	private fun extractJsonString(script: String, responseStart: Int): String {
-		val stringBuilder = StringBuilder()
-		var bracketCount = 0
-		var i = responseStart
-
-		while (i < script.length) {
-			val c = script[i]
-			stringBuilder.append(c)
-			if (c == '{') bracketCount++
-			if (c == '}') bracketCount--
-			if (bracketCount == 0) break
-			i++
-		}
-		return stringBuilder.toString()
-	}
-
-	private fun extractGenres(item: JSONObject): Set<MangaTag> {
-		return item.optJSONArray("genres")?.let { genresArray ->
-			(0 until genresArray.length()).mapNotNull { gIdx ->
-				genresArray.optJSONObject(gIdx)?.let { genreItem ->
-					MangaTag(
-						key = genreItem.optString("slug"),
-						title = genreItem.optString("name"),
-						source = source
-					)
-				}
-			}.toSet()
-		} ?: emptySet()
-	}
-
-	private fun extractAuthors(item: JSONObject): Set<String> {
-		return item.optJSONArray("authors")?.let { authorsArray ->
-			(0 until authorsArray.length()).mapNotNull { aIdx ->
-				authorsArray.optJSONObject(aIdx)?.optString("name")
-			}.toSet()
-		} ?: emptySet()
+	companion object {
+		private val DATE_NUMBER_REGEX = Regex("""\d+""")
+		private val WHITESPACE_REGEX = Regex("""\s+""")
 	}
 }

@@ -4,13 +4,17 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
+import okhttp3.Interceptor
+import okhttp3.Response
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
+import java.io.InterruptedIOException
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 @MangaSourceParser("KURONEKO", "Kuro Neko / vi-Hentai", "vi", type = ContentType.HENTAI)
 internal class KuroNeko(context: MangaLoaderContext) : PagedMangaParser(context, MangaParserSource.KURONEKO, 30) {
@@ -20,6 +24,13 @@ internal class KuroNeko(context: MangaLoaderContext) : PagedMangaParser(context,
 	private val pagesRequestMutex = Mutex()
 	private var lastPagesRequestTime = 0L
 
+	private val rateLimitLock = Any()
+	private var nextDomainRequestAt = 0L
+	private var nextImageRequestAt = 0L
+
+	@Volatile
+	private var cooldownUntilMs = 0L
+
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
@@ -28,6 +39,69 @@ internal class KuroNeko(context: MangaLoaderContext) : PagedMangaParser(context,
 	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
 		.add("Referer", "https://$domain/")
 		.build()
+
+	override fun intercept(chain: Interceptor.Chain): Response {
+		val request = chain.request()
+		val isDomainDocument = request.url.host.equals(domain, ignoreCase = true) &&
+			!IMAGE_EXT_REGEX.containsMatchIn(request.url.encodedPath)
+
+		for (attempt in 0..MAX_RATE_LIMIT_RETRIES) {
+			acquireRateLimitSlot(isDomainDocument)
+			val response = chain.proceed(request)
+			val isRateLimited = response.code == 429 || (
+				isDomainDocument &&
+					response.code in 200..599 &&
+					response.headersContentLength().let { it < 0L || it <= 16384L } &&
+					response.mimeType?.startsWith("text/") == true &&
+					runCatching { response.peekBody(8192).string() }.getOrDefault("").let { body ->
+						body.contains("quá nhanh", ignoreCase = true) ||
+							body.contains("Too Many Requests", ignoreCase = true)
+					}
+				)
+			if (!isRateLimited || attempt == MAX_RATE_LIMIT_RETRIES) {
+				return response
+			}
+			val retryAfterSeconds = response.header("Retry-After")?.trim()?.toLongOrNull()
+			val retryDelayMs = if (retryAfterSeconds != null && retryAfterSeconds > 0L) {
+				TimeUnit.SECONDS.toMillis(retryAfterSeconds).coerceIn(MIN_RETRY_DELAY_MS, MAX_RETRY_DELAY_MS)
+			} else {
+				(BASE_RETRY_DELAY_MS shl attempt).coerceAtMost(MAX_RETRY_DELAY_MS)
+			}
+			synchronized(rateLimitLock) {
+				cooldownUntilMs = maxOf(cooldownUntilMs, System.currentTimeMillis() + retryDelayMs)
+			}
+			runCatching { response.close() }
+		}
+		return chain.proceed(request)
+	}
+
+	private fun acquireRateLimitSlot(isDomainDocument: Boolean) {
+		val waitUntilCooldown = cooldownUntilMs - System.currentTimeMillis()
+		sleepSafely(waitUntilCooldown)
+		val waitMs = synchronized(rateLimitLock) {
+			val now = System.currentTimeMillis()
+			val minInterval = if (isDomainDocument) DOMAIN_MIN_INTERVAL_MS else IMAGE_MIN_INTERVAL_MS
+			val lastScheduled = if (isDomainDocument) nextDomainRequestAt else nextImageRequestAt
+			val scheduled = maxOf(now, cooldownUntilMs, lastScheduled)
+			if (isDomainDocument) {
+				nextDomainRequestAt = scheduled + minInterval
+			} else {
+				nextImageRequestAt = scheduled + minInterval
+			}
+			scheduled - now
+		}
+		sleepSafely(waitMs)
+	}
+
+	private fun sleepSafely(ms: Long) {
+		if (ms <= 0L) return
+		try {
+			Thread.sleep(ms)
+		} catch (e: InterruptedException) {
+			Thread.currentThread().interrupt()
+			throw InterruptedIOException("Rate-limit wait interrupted").apply { initCause(e) }
+		}
+	}
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.ALPHABETICAL,
@@ -139,33 +213,40 @@ internal class KuroNeko(context: MangaLoaderContext) : PagedMangaParser(context,
 		}
 
 		val doc = webClient.httpGet(url).parseHtml()
-		return doc.select("div.grid div.relative")
-			.map { div ->
-				val href = div.selectFirst("a[href^=/truyen/]")?.attrOrNull("href")
-					?: div.parseFailed("Không thể tìm thấy nguồn ảnh của Manga này!")
-				val coverUrl = div.selectFirst("div.cover")?.attr("style")
-					?.substringAfter("url('")?.substringBefore("')")
+		val cards = doc.select("div.grid div.relative").ifEmpty { doc.select("div.manga-vertical") }
+		return cards.map { div ->
+			val href = div.selectFirst("a[href^=/truyen/]")?.attrOrNull("href")
+				?: div.parseFailed("Không thể tìm thấy nguồn ảnh của Manga này!")
+			val style = div.selectFirst("div.cover")?.attr("style").orEmpty()
+			val coverUrl = BACKGROUND_IMAGE_REGEX.find(style)?.groupValues?.getOrNull(1)
+				?.ifBlank { null }
+				?: style.substringAfter("url('", "").substringBefore("')", "").ifBlank { null }
+			val title = div.select("div.p-2 a.text-ellipsis").text()
+				.ifBlank { div.select("div.p-2 a").text() }
 
-				Manga(
-					id = generateUid(href),
-					title = div.select("div.p-2 a.text-ellipsis").text(),
-					altTitles = emptySet(),
-					url = href,
-					publicUrl = href.toAbsoluteUrl(domain),
-					rating = RATING_UNKNOWN,
-					contentRating = ContentRating.ADULT,
-					coverUrl = coverUrl.orEmpty(),
-					tags = setOf(),
-					state = null,
-					authors = emptySet(),
-					source = source,
-				)
-			}
+			Manga(
+				id = generateUid(href),
+				title = title,
+				altTitles = emptySet(),
+				url = href,
+				publicUrl = href.toAbsoluteUrl(domain),
+				rating = RATING_UNKNOWN,
+				contentRating = ContentRating.ADULT,
+				coverUrl = coverUrl.orEmpty(),
+				tags = setOf(),
+				state = null,
+				authors = emptySet(),
+				source = source,
+			)
+		}
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val root = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
 		val author = root.selectFirst("div.mt-2:contains(Tác giả) span a")?.textOrNull()
+		val scanlator = root.selectFirst("div.mt-2:contains(Nhóm dịch) span a")?.textOrNull()
+		val chapterElements = root.select("div.justify-between ul.overflow-y-auto.overflow-x-hidden a")
+			.ifEmpty { root.select("ul.overflow-y-auto > li a[href*=/truyen/]") }
 
 		return manga.copy(
 			altTitles = setOfNotNull(root.selectLast("div.grow div:contains(Tên khác) span")?.textOrNull()),
@@ -183,24 +264,22 @@ internal class KuroNeko(context: MangaLoaderContext) : PagedMangaParser(context,
 			},
 			authors = setOfNotNull(author),
 			description = root.selectFirst("meta[name=description]")?.attrOrNull("content"),
-			chapters = root.select("div.justify-between ul.overflow-y-auto.overflow-x-hidden a")
-				.mapChapters(reversed = true) { i, a ->
-					val href = a.attrAsRelativeUrl("href")
-					val name = a.selectFirst("span.text-ellipsis")?.text().orEmpty()
-					val dateText = a.parent()?.selectFirst("span.timeago")?.attr("datetime").orEmpty()
-					val scanlator = root.selectFirst("div.mt-2:contains(Nhóm dịch) span a")?.textOrNull()
-					MangaChapter(
-						id = generateUid(href),
-						title = name,
-						number = i.toFloat(),
-						volume = 0,
-						url = href,
-						scanlator = scanlator,
-						uploadDate = parseDateTime(dateText),
-						branch = null,
-						source = source,
-					)
-				},
+			chapters = chapterElements.mapChapters(reversed = true) { i, a ->
+				val href = a.attrAsRelativeUrl("href")
+				val name = a.selectFirst("span.text-ellipsis, span.truncate")?.textOrNull() ?: a.text()
+				val dateText = a.parent()?.selectFirst("span.timeago")?.attr("datetime").orEmpty()
+				MangaChapter(
+					id = generateUid(href),
+					title = name,
+					number = i + 1f,
+					volume = 0,
+					url = href,
+					scanlator = scanlator,
+					uploadDate = parseDateTime(dateText),
+					branch = null,
+					source = source,
+				)
+			},
 		)
 	}
 
@@ -319,8 +398,16 @@ internal class KuroNeko(context: MangaLoaderContext) : PagedMangaParser(context,
 	}.getOrDefault(0L)
 
 	companion object {
-		private const val PAGES_REQUEST_DELAY_MS = 5000L
+		private const val PAGES_REQUEST_DELAY_MS = 1500L
+		private const val DOMAIN_MIN_INTERVAL_MS = 1200L
+		private const val IMAGE_MIN_INTERVAL_MS = 250L
+		private const val BASE_RETRY_DELAY_MS = 3000L
+		private const val MIN_RETRY_DELAY_MS = 2000L
+		private const val MAX_RETRY_DELAY_MS = 30000L
+		private const val MAX_RATE_LIMIT_RETRIES = 3
 		private const val BASE_CHARSET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
+		private val IMAGE_EXT_REGEX = Regex("""\.(?:jpe?g|png|webp|gif|avif|bmp)$""", RegexOption.IGNORE_CASE)
+		private val BACKGROUND_IMAGE_REGEX = Regex("""background-image:\s*url\(['"]?(.*?)['"]?\)""", RegexOption.IGNORE_CASE)
 		private val PACKED_IMAGE_URL_REGEX = Regex("""["'](https?:\\?/\\?/[^"']+\.\w{3,5}(?:\?[^"']*)?)["']""")
 		private val PACKED_ARGS_REGEX = Regex("""\}\("([^"]+)",\s*(\d+),\s*"([^"]+)",\s*(\d+),\s*(\d+),\s*(\d+)\)""")
 	}

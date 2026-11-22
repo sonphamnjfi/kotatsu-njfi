@@ -2,6 +2,7 @@ package org.koitharu.kotatsu.browser
 
 import android.os.Bundle
 import android.view.View
+import android.webkit.CookieManager
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.isVisible
 import androidx.core.view.updatePadding
@@ -76,6 +77,7 @@ abstract class BaseBrowserActivity : BaseActivity<ActivityBrowserBinding>(), Bro
 
 	override fun onPause() {
 		viewBinding.webView.onPause()
+		CookieManager.getInstance().flush()
 		super.onPause()
 	}
 
