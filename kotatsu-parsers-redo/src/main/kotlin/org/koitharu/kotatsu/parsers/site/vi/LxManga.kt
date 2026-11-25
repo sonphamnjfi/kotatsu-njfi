@@ -1,6 +1,7 @@
 package org.koitharu.kotatsu.parsers.site.vi
 
 import okhttp3.Headers
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
@@ -32,6 +33,9 @@ internal class LxManga(context: MangaLoaderContext) : PagedMangaParser(context, 
 	override val configKeyDomain = ConfigKey.Domain("lxmanga.top", "lxmanga.my")
 
 	private val availableTags = suspendLazy(initializer = ::fetchTags)
+
+	@Volatile
+	private var latestActionToken: String = ""
 
 	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
 		.set("Referer", "https://$domain/")
@@ -66,10 +70,13 @@ internal class LxManga(context: MangaLoaderContext) : PagedMangaParser(context, 
 
 	override fun intercept(chain: Interceptor.Chain): Response {
 		val request = chain.request()
-		val fragment = request.url.fragment
+		val originalUrl = unwrapImageProxy(request.url)
+		val fragment = originalUrl.fragment
 		if (fragment != null && fragment.startsWith(TOKEN_FRAGMENT_PREFIX)) {
-			val token = fragment.removePrefix(TOKEN_FRAGMENT_PREFIX).ifEmpty { "x" }
-			val cleanUrl = request.url.newBuilder().fragment(null).build()
+			val token = fragment.removePrefix(TOKEN_FRAGMENT_PREFIX).ifEmpty {
+				latestActionToken.ifEmpty { "x" }
+			}
+			val cleanUrl = originalUrl.newBuilder().fragment(null).build()
 			val newRequest = request.newBuilder()
 				.url(cleanUrl)
 				.header("Referer", "https://$domain/")
@@ -78,7 +85,29 @@ internal class LxManga(context: MangaLoaderContext) : PagedMangaParser(context, 
 				.build()
 			return chain.proceed(newRequest)
 		}
+		if (!originalUrl.host.equals(domain, ignoreCase = true) && request.header("Token") == null && latestActionToken.isNotEmpty()) {
+			val newRequest = request.newBuilder()
+				.url(originalUrl)
+				.header("Referer", "https://$domain/")
+				.header("Origin", "https://$domain")
+				.header("Token", latestActionToken)
+				.build()
+			return chain.proceed(newRequest)
+		}
+		if (originalUrl != request.url) {
+			return chain.proceed(request.newBuilder().url(originalUrl).build())
+		}
 		return chain.proceed(request)
+	}
+
+	private fun unwrapImageProxy(url: HttpUrl): HttpUrl = when (url.host) {
+		"wsrv.nl" -> url.queryParameter("url")?.toHttpUrlOrNull() ?: url
+		"v.recipes" -> url.toString()
+			.substringAfter("https://v.recipes/i/", "")
+			.takeIf(String::isNotEmpty)
+			?.toHttpUrlOrNull()
+			?: url
+		else -> url
 	}
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
@@ -360,20 +389,17 @@ internal class LxManga(context: MangaLoaderContext) : PagedMangaParser(context, 
 		}
 
 		val data = response.parseJson()
-		if (data.optBoolean("is_bot", true)) {
-			return TokenFetchResult.BrowserRequired
-		}
 		val actionToken = data.optString("action_token").takeIf { it.isNotEmpty() }
 			?: data.optString("e").takeIf { it.isNotEmpty() }?.let { encrypted ->
 				xorB64Decode(encrypted, mfKey)
 					?.let { decoded -> runCatching { JSONObject(decoded).optString("at") }.getOrNull() }
 					?.takeIf { it.isNotEmpty() }
 			}
-		return if (actionToken != null) {
-			TokenFetchResult.Success(actionToken)
-		} else {
-			TokenFetchResult.BrowserRequired
+		if (actionToken != null) {
+			latestActionToken = actionToken
+			return TokenFetchResult.Success(actionToken)
 		}
+		return TokenFetchResult.BrowserRequired
 	}
 
 	private suspend fun fetchImageManifest(
@@ -439,27 +465,39 @@ internal class LxManga(context: MangaLoaderContext) : PagedMangaParser(context, 
 		val responseJson = response.parseJson()
 		val dispatches = responseJson.optJSONObject("effects")?.optJSONArray("dispatches")
 			?: return ManifestFetchResult.Success(emptyList())
-		var encodedData: String? = null
+		var dispatchData: JSONObject? = null
 		for (i in 0 until dispatches.length()) {
 			val dispatch = dispatches.optJSONObject(i) ?: continue
 			if (dispatch.optString("event") == "lx:srcs") {
-				encodedData = dispatch.optJSONObject("data")?.optString("data")?.takeIf { it.isNotEmpty() }
-				if (encodedData != null) break
+				dispatchData = dispatch.optJSONObject("data")
+				if (dispatchData != null) break
 			}
 		}
-		val decodedManifest = encodedData?.let { xorB64Decode(it, mfKey) }
-			?: return ManifestFetchResult.Success(emptyList())
-		val manifestJson = runCatching { JSONObject(decodedManifest) }.getOrNull()
-			?: return ManifestFetchResult.Success(emptyList())
-		val u = manifestJson.optJSONArray("u") ?: return ManifestFetchResult.Success(emptyList())
-		val f = manifestJson.optJSONArray("f")
+		if (dispatchData == null) {
+			return ManifestFetchResult.Success(emptyList())
+		}
+
+		val encodedData = dispatchData.optString("data").takeIf { it.isNotEmpty() }
+		val u: JSONArray
+		val f: JSONArray?
+		if (encodedData != null) {
+			val decodedManifest = xorB64Decode(encodedData, mfKey)
+				?: return ManifestFetchResult.Success(emptyList())
+			val manifestJson = runCatching { JSONObject(decodedManifest) }.getOrNull()
+				?: return ManifestFetchResult.Success(emptyList())
+			u = manifestJson.optJSONArray("u") ?: return ManifestFetchResult.Success(emptyList())
+			f = manifestJson.optJSONArray("f") ?: dispatchData.optJSONArray("flags")
+		} else {
+			u = dispatchData.optJSONArray("urls") ?: return ManifestFetchResult.Success(emptyList())
+			f = dispatchData.optJSONArray("flags")
+		}
 
 		val urls = ArrayList<String>(u.length())
 		for (i in 0 until u.length()) {
 			val flag = f?.optInt(i, 0) ?: 0
 			if ((flag and 1) == 0) {
 				val url = u.optString(i).trim()
-				if (url.isNotEmpty()) {
+				if (url.isNotEmpty() && !url.contains("/imgs/gifs/", ignoreCase = true)) {
 					urls.add(url)
 				}
 			}
@@ -550,13 +588,12 @@ internal class LxManga(context: MangaLoaderContext) : PagedMangaParser(context, 
 	}
 
 	private fun xorB64Decode(payload: String, key: String): String? = runCatching {
+		if (key.isEmpty()) return null
 		val bytes = context.decodeBase64(payload.filterNot { it.isWhitespace() })
-		val keyBytes = key.toByteArray(Charsets.UTF_8)
-		if (keyBytes.isEmpty()) return null
-		for (i in bytes.indices) {
-			bytes[i] = (bytes[i].toInt() xor keyBytes[i % keyBytes.size].toInt()).toByte()
+		val chars = CharArray(bytes.size) { i ->
+			((bytes[i].toInt() and 0xff) xor key[i % key.length].code).toChar()
 		}
-		String(bytes, Charsets.UTF_8)
+		String(chars)
 	}.getOrNull()
 
 	private fun parseBackgroundUrl(styleValue: String?): String? {

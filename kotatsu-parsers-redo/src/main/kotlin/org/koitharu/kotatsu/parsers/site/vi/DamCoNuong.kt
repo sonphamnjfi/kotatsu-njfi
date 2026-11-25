@@ -3,6 +3,7 @@ package org.koitharu.kotatsu.parsers.site.vi
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
@@ -75,14 +76,19 @@ internal class DamCoNuong(context: MangaLoaderContext) :
 
 	override fun intercept(chain: Interceptor.Chain): Response {
 		val request = chain.request()
-		val key = request.url.fragment
+		val originalUrl = unwrapImageProxy(request.url)
+		val key = originalUrl.fragment
 			?.takeIf { it.startsWith(SCRAMBLE_PREFIX) && it.length == SCRAMBLE_KEY_LENGTH }
-			?: return chain.proceed(request)
+			?: return chain.proceed(
+				if (originalUrl != request.url) request.newBuilder().url(originalUrl).build() else request,
+			)
 		val seed = decodeBase64Url(key.removePrefix(SCRAMBLE_PREFIX))
 			?.takeIf { it.size == SCRAMBLE_SEED_LENGTH }
-			?: return chain.proceed(request)
+			?: return chain.proceed(
+				if (originalUrl != request.url) request.newBuilder().url(originalUrl).build() else request,
+			)
 
-		val cleanUrl = request.url.newBuilder().fragment(null).build()
+		val cleanUrl = originalUrl.newBuilder().fragment(null).build()
 		val response = chain.proceed(request.newBuilder().url(cleanUrl).build())
 		if (!response.isSuccessful) {
 			return response
@@ -90,6 +96,16 @@ internal class DamCoNuong(context: MangaLoaderContext) :
 		return context.redrawImageResponse(response) { bitmap ->
 			descrambleBitmap(bitmap, seed)
 		}
+	}
+
+	private fun unwrapImageProxy(url: HttpUrl): HttpUrl = when (url.host) {
+		"wsrv.nl" -> url.queryParameter("url")?.toHttpUrlOrNull() ?: url
+		"v.recipes" -> url.toString()
+			.substringAfter("https://v.recipes/i/", "")
+			.takeIf(String::isNotEmpty)
+			?.toHttpUrlOrNull()
+			?: url
+		else -> url
 	}
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {

@@ -127,7 +127,7 @@ publishing {
         create<MavenPublication>("mavenJava") {
             groupId = "com.github.clquwu"
             artifactId = "kotatsu-parsers-redo"
-            version = "3432a85ac0"
+            version = (findProperty("parsersMavenVersion") as String?) ?: "3432a85ac0"
             from(components["java"])
         }
     }
